@@ -3,8 +3,21 @@ const cors = require("cors");
 const app = express();
 require("dotenv").config();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const stripe = require("stripe")(process.env.PAYMENT_GETWAY_SECRECT);
 
 const port = process.env.PORT || 3000;
+const crypto = require("crypto");
+
+function generateTrackingId() {
+  const prefix = "PRCL";
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+
+  // Random HEX (6 chars)
+  const randomHex = crypto.randomBytes(3).toString("hex").toUpperCase();
+
+  return `${prefix}-${date}-${randomHex}`;
+}
+
 
 // middleware
 app.use(express.json());
@@ -30,6 +43,7 @@ async function run() {
 
     const db = client.db("zap_shift_server");
     const percelConnection = db.collection("percels");
+    const paymentConnection = db.collection("payments");
 
     // percel api
     app.get("/percels", async (req, res) => {
@@ -67,14 +81,128 @@ async function run() {
       res.send(result);
     });
 
+    // payment related apis
+
+    const DOMAIN = process.env.DOMAIN_SITE;
+    app.post("/create-checkout-session", async (req, res) => {
+      const paymentInfo = req.body;
+      const amount = parseInt(paymentInfo.cost) * 100;
+
+      console.log("Payment info received:", paymentInfo);
+
+      const session = await stripe.checkout.sessions.create({
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              unit_amount: amount,
+              product_data: {
+                name: paymentInfo.parcelName,
+              },
+            },
+            quantity: 1,
+          },
+        ],
+        customer_email: paymentInfo.senderEmail,
+        mode: "payment",
+        metadata: {
+          percelId: paymentInfo.percelId,
+          percelName: paymentInfo.percelName,
+        },
+        success_url: `${DOMAIN}/dashboardLayout/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+
+        cancel_url: `${DOMAIN}/dashboardLayout/payment-cancel`,
+      });
+      console.log(session);
+      res.send({ url: session.url });
+    });
+
+    app.patch("/payment-success", async (req, res) => {
+      const sessionId = req.query.sessionId;
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+        const transactionId= session.payment_intent;
+        const query = { transactionId: transactionId }
+
+        const paymentExit = await paymentConnection.findOne(query);
+        if(paymentExit){
+          return res.send({
+            message:'alreary exits',
+            transactionId,
+            trackingId:paymentExit.trackingId,
+          })
+        }
+
+
+
+      const trackingId = generateTrackingId();
+      if (session.payment_status === "paid") {
+        const id = session.metadata.percelId;
+        const query = { _id: new ObjectId(id) };
+        const upadate = {
+          $set: {
+            paymentStatus: "paid",
+            trackingId:trackingId,
+          },
+        };
+        const result = await percelConnection.updateOne(query, upadate);
+        const payment = {
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          customerEmail: session.customer_email,
+          percelId: session.metadata.percelId,
+          percelName: session.metadata.percelName,
+          transactionId: session.payment_intent,
+          paymentStatus: session.payment_status,
+          paidAt: new Date(),
+          trackingId: trackingId,
+        };
+        if (
+          session.payment_status === "paid" ||
+          session.status === "complete"
+        ) {
+          const resultPayment = await paymentConnection.insertOne(payment);
+
+          res.send({
+            succes: true,
+            modifyPercel: result,
+            paymentInfo: resultPayment,
+            trackingId: trackingId,
+            transactionId: session.payment_intent,
+          });
+        }
+      }
+      return res.send({ success: false });
+    });
+
+
+app.get('/payments',async (req,res) =>{
+  const email = req.query.email;
+  const query = {};
+  if(email){
+    query.customerEmail = email;
+  }
+  const cursor = paymentConnection.find(query);
+  const result = await  cursor.toArray();
+  res.send(result);
+})
+
+
+
+
+
+
+
+
+
+
+
+
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!"
     );
   } finally {
-    // Ensures that the client will close when you finish/error
-    // await client.close();
   }
 }
 run().catch(console.dir);
